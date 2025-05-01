@@ -13,8 +13,11 @@ defmodule SportsInfoWeb.MatchListLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    IO.puts("MatchListLive: Mounting..............................................................................................................................................................")
     sport = "soccer"
-    Phoenix.PubSub.subscribe(SportsInfo.PubSub, "sports:events:#{sport}")
+    topic = "sports:events:#{sport}"
+    IO.puts("MatchListLive: Subscribing to topic #{topic}")
+    Phoenix.PubSub.subscribe(SportsInfo.PubSub, topic)
 
     socket = assign(socket, %{
       sport: sport,
@@ -56,8 +59,12 @@ defmodule SportsInfoWeb.MatchListLive do
 
   @impl true
   def handle_event("select_sport", %{"sport" => sport}, socket) do
-    Phoenix.PubSub.unsubscribe(SportsInfo.PubSub, "sports:events:#{socket.assigns.sport}")
-    Phoenix.PubSub.subscribe(SportsInfo.PubSub, "sports:events:#{sport}")
+    old_topic = "sports:events:#{socket.assigns.sport}"
+    new_topic = "sports:events:#{sport}"
+    IO.puts("MatchListLive: Unsubscribing from topic #{old_topic}")
+    Phoenix.PubSub.unsubscribe(SportsInfo.PubSub, old_topic)
+    IO.puts("MatchListLive: Subscribing to topic #{new_topic}")
+    Phoenix.PubSub.subscribe(SportsInfo.PubSub, new_topic)
 
     {events, total} = fetch_events(sport, 1, socket.assigns.show_in_play_only, socket.assigns.sort_by, socket.assigns.search_query)
     leagues = group_events_by_league(events)
@@ -99,7 +106,7 @@ defmodule SportsInfoWeb.MatchListLive do
 
   @impl true
   def handle_event("update_visible_events", %{"league" => league, "visible_ids" => visible_ids}, socket) do
-    IO.puts("MatchListLive: Updating visible events for league #{league} with IDs #{inspect(visible_ids)}")
+    IO.puts("handle_event: Updating visible events for league #{league} with IDs #{inspect(visible_ids)}")
     visible_event_ids = MapSet.new(visible_ids)
     league_events = socket.assigns.leagues[league] || []
 
@@ -109,6 +116,8 @@ defmodule SportsInfoWeb.MatchListLive do
 
     visible_events_by_league = Map.put(socket.assigns.visible_events_by_league, league, visible_events)
     visible_event_ids_by_league = Map.put(socket.assigns.visible_event_ids_by_league, league, visible_event_ids)
+
+    IO.puts("handle_event: Updated visible_event_ids_by_league: #{inspect(visible_event_ids_by_league)}")
 
     {:noreply, assign(socket, visible_events_by_league: visible_events_by_league, visible_event_ids_by_league: visible_event_ids_by_league)}
   end
@@ -206,23 +215,38 @@ defmodule SportsInfoWeb.MatchListLive do
 
   @impl true
   def handle_info({:event_update, event_id, event}, socket) do
+    #IO.puts("MatchListLive: Received event update for event #{event_id}, sport #{event["sport"]}, expected sport #{socket.assigns.sport}")
+    #IO.puts("MatchListLive: Event details - cmp_name: #{event["cmp_name"]}, id: #{event_id}")
     if event["sport"] == socket.assigns.sport do
-      IO.puts("MatchListLive: Received event update for event #{event_id}: time=#{event["et"]}, score=#{inspect(Map.get(event, "stats", %{}))}, odds=#{inspect(Map.get(event, "odds", []))}")
+      #IO.puts("MatchListLive: Processing update for event #{event_id}: time=#{event["et"]}, score=#{inspect(Map.get(event, "stats", %{}))}")
       updated_events = update_event(socket.assigns.events, event_id, event)
       leagues = group_events_by_league(updated_events)
 
       league = event["cmp_name"] || "Unknown League"
       league_events = leagues[league] || []
-      visible_event_ids = Map.get(socket.assigns.visible_event_ids_by_league, league, MapSet.new())
 
+      # Log the entire visible_event_ids_by_league for debugging
+      #IO.puts("Handle_info: Current visible_event_ids_by_league: #{inspect(socket.assigns.visible_event_ids_by_league)}")
+
+      # Retrieve the visible event IDs for the league
+      visible_event_ids = Map.get(socket.assigns.visible_event_ids_by_league, league, MapSet.new())
+      IO.puts("Handle_info: Visible event IDs for league #{league}: #{inspect(visible_event_ids)}")
+
+      # Push the update to the client regardless of visibility; client will handle visibility
+      #IO.puts("Handle_info: Pushing update to client for event #{event_id}")
+      socket = push_event(socket, "update_event", %{id: event_id, data: event})
+
+      # Update the assigns for consistency
       visible_events = league_events
                        |> Enum.filter(fn e -> MapSet.member?(visible_event_ids, e["id"]) end)
                        |> Enum.take(@visible_events_limit)
-
       visible_events_by_league = Map.put(socket.assigns.visible_events_by_league, league, visible_events)
+
+      IO.puts("Handle_info: Updated visible events for league #{league}, count: #{length(visible_events)}")
 
       {:noreply, assign(socket, events: updated_events, leagues: leagues, visible_events_by_league: visible_events_by_league, total_events: length(updated_events))}
     else
+      IO.puts("Handle_info: Ignoring update for event #{event_id} due to sport mismatch")
       {:noreply, socket}
     end
   end
@@ -250,8 +274,10 @@ defmodule SportsInfoWeb.MatchListLive do
   defp update_event(events, event_id, new_event) do
     case Enum.find_index(events, fn e -> e["id"] == event_id end) do
       nil ->
+        IO.puts("MatchListLive: Adding new event #{event_id} to events list")
         [new_event | events]
       index ->
+        IO.puts("MatchListLive: Updating existing event #{event_id} at index #{index}")
         List.replace_at(events, index, new_event)
     end
   end
@@ -403,7 +429,7 @@ defmodule SportsInfoWeb.MatchListLive do
             <div class="mb-2">
               <!-- League Header with Toggle -->
               <div class="flex justify-between items-center mb-1">
-                <h2 class="text-sm md:text-base font-bold text-[#00c4b4] flex items-center">
+                <h2 class="text-sm md:text-base font-bold text-[#00c4b4] flex items-center" style="line-height: 2.5rem;">
                   <svg class="w-4 h-4 mr-1" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>
                   </svg>
@@ -449,14 +475,14 @@ defmodule SportsInfoWeb.MatchListLive do
                       class="match-row cursor-pointer absolute w-full transition-all duration-200 hover:bg-[#3a3a3a] hover:shadow-md"
                       style={"top: #{event_position(event, league_events)}px;"}
                     >
-                      <div class="flex items-center justify-center">
+                      <div class="time flex items-center justify-center">
                         <%= if event["et"] do %>
-                          <span class="text-[#00c4b4] font-bold"><%= format_time(event["et"]) %></span>
+                          <span class="text-[#00c4b4] font-bold time-value"><%= format_time(event["et"]) %></span>
                           <svg class="w-3 h-3 ml-1 text-red-500 animate-pulse" fill="currentColor" viewBox="0 0 24 24">
                             <circle cx="12" cy="12" r="10"/>
                           </svg>
                         <% else %>
-                          <span class="text-gray-400"><%= format_start_time(event["id"]) %></span>
+                          <span class="text-gray-400 time-value"><%= format_start_time(event["id"]) %></span>
                         <% end %>
                       </div>
                       <div class="col-span-2 flex justify-between items-center">
@@ -464,7 +490,7 @@ defmodule SportsInfoWeb.MatchListLive do
                           <div class="w-5 h-5 bg-gray-500 rounded-full"></div>
                           <span class="truncate text-xs md:text-sm"><%= event["t1"]["n"] %></span>
                         </div>
-                        <span class="mx-1 text-[#ffcd00] font-bold">
+                        <span class="score mx-1 text-[#ffcd00] font-bold">
                           <%= get_score(event, "a", 0) %>:<%= get_score(event, "a", 1) %>
                         </span>
                         <div class="flex items-center space-x-1 truncate">
@@ -474,13 +500,13 @@ defmodule SportsInfoWeb.MatchListLive do
                       </div>
                       <%= case get_odds(event, @selected_market) do %>
                         <% %{"1" => home, "X" => tie, "2" => away} -> %>
-                          <div class="text-[#ffcd00] font-bold text-xs md:text-sm"><%= home %></div>
-                          <div class="text-[#ffcd00] font-bold text-xs md:text-sm"><%= tie %></div>
-                          <div class="text-[#ffcd00] font-bold text-xs md:text-sm"><%= away %></div>
+                          <div class="odds-home text-[#ffcd00] font-bold text-xs md:text-sm"><%= home %></div>
+                          <div class="odds-tie text-[#ffcd00] font-bold text-xs md:text-sm"><%= tie %></div>
+                          <div class="odds-away text-[#ffcd00] font-bold text-xs md:text-sm"><%= away %></div>
                         <% _ -> %>
-                          <div>-</div>
-                          <div>-</div>
-                          <div>-</div>
+                          <div class="odds-home">-</div>
+                          <div class="odds-tie">-</div>
+                          <div class="odds-away">-</div>
                       <% end %>
                       <button
                         phx-click="toggle_favorite"
@@ -504,9 +530,6 @@ defmodule SportsInfoWeb.MatchListLive do
             </div>
           <% end %>
         <% end %>
-
-        <!-- Infinite Scroll Trigger -->
-        <div id="infinite-scroll-trigger" phx-hook="InfiniteScroll" data-all-loaded={@all_events_loaded}></div>
       </div>
     </div>
     """

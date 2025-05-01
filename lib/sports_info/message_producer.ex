@@ -16,7 +16,7 @@ defmodule SportsInfo.MessageProducer do
   end
 
   def add_message(event_id, message) do
-    IO.puts("MessageProducer: Adding message for event #{event_id}: ")#{inspect(message)}
+    #IO.puts("MessageProducer: Adding message for event #{event_id}: ")#{inspect(message)}
     GenStage.cast(__MODULE__, {:add_message, event_id, message})
   end
 

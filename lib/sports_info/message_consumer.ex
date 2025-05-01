@@ -21,7 +21,7 @@ defmodule SportsInfo.MessageConsumer do
 
   def handle_events(events, _from, state) do
     Enum.each(events, fn {event_id, message} ->
-      IO.puts("MessageConsumer: Processing message for event #{event_id}: ")#{inspect(message)}
+      #IO.puts("MessageConsumer: Processing message for event #{event_id}: ")#{inspect(message)}
       SportsInfo.EventWorker.process_message(event_id, message)
     end)
     {:noreply, [], state}

@@ -56,18 +56,17 @@ defmodule SportsInfo.EventWorker do
     start_time = System.monotonic_time()
     %{shard: shard, ets_tables: ets_tables, updates: updates, pending_updates: pending_updates, last_updated: last_updated, initialized: initialized} = state
 
-    # Extract the sport based on message type
     sport = case message do
       %{"mt" => "avl", "evts" => events} ->
-        # For avl messages, the sport is in the event map within "evts"
         event = Enum.find(events, fn e -> e["id"] == event_id end)
         if event, do: Map.get(event, "sport", "unknown"), else: "unknown"
       %{"mt" => "updt"} ->
-        # For updt messages, the sport is at the top level
         Map.get(message, "sport", "unknown")
       _ ->
         "unknown"
     end
+
+    #IO.puts("EventWorker: Processing message for event #{event_id} with sport #{sport}")
 
     ets_table = ensure_ets_table(sport, shard, ets_tables)
 
@@ -76,7 +75,7 @@ defmodule SportsInfo.EventWorker do
         event = Enum.find(message["evts"], fn e -> e["id"] == event_id end)
         if event do
           updated_event = Map.put(event, "sport", sport)
-          IO.puts("EventWorker: Storing avl event #{event_id} in ETS for sport #{sport}")
+          #IO.puts("EventWorker: Storing avl event #{event_id} in ETS for sport #{sport}")
           :ets.insert(ets_table, {event_id, updated_event})
 
           new_initialized = Map.put(initialized, {sport, event_id}, true)
@@ -86,7 +85,7 @@ defmodule SportsInfo.EventWorker do
               pending_updates
             pending_message ->
               merged_event = Map.merge(updated_event, pending_message)
-              IO.puts("EventWorker: Applying pending update for event #{event_id} in sport #{sport}")
+              #IO.puts("EventWorker: Applying pending update for event #{event_id} in sport #{sport}")
               :ets.insert(ets_table, {event_id, merged_event})
               Map.delete(pending_updates, {sport, event_id})
           end
@@ -106,7 +105,7 @@ defmodule SportsInfo.EventWorker do
           }
           {:noreply, new_state}
         else
-          IO.puts("EventWorker: Event #{event_id} not found in avl message")
+          #IO.puts("EventWorker: Event #{event_id} not found in avl message")
           {:noreply, state}
         end
 
@@ -120,7 +119,7 @@ defmodule SportsInfo.EventWorker do
             updated_event = Map.merge(existing_event, message)
                            |> Map.put("sport", sport)
                            |> ensure_cmp_name(existing_event)
-            IO.puts("EventWorker: Updating event #{event_id} in ETS for sport #{sport}")
+            #IO.puts("EventWorker: Updating event #{event_id} in ETS for sport #{sport}")
             :ets.insert(ets_table, {event_id, updated_event})
 
             current_time = System.monotonic_time(:millisecond)
@@ -136,7 +135,7 @@ defmodule SportsInfo.EventWorker do
             }
             {:noreply, new_state}
           [] ->
-            IO.puts("EventWorker: Buffering updt message for event #{event_id} in sport #{sport} (no prior avl message)")
+            #IO.puts("EventWorker: Buffering updt message for event #{event_id} in sport #{sport} (no prior avl message)")
             new_pending_updates = Map.put(pending_updates, {sport, event_id}, message)
 
             current_time = System.monotonic_time(:millisecond)
@@ -161,10 +160,10 @@ defmodule SportsInfo.EventWorker do
     Enum.each(updates, fn {{sport, event_id}, event} ->
       if Map.get(initialized, {sport, event_id}, false) do
         topic = "#{@pubsub_topic}:#{sport}"
-        IO.puts("EventWorker: Broadcasting update for event #{event_id} to topic #{topic}")
+        #IO.puts("EventWorker: Broadcasting update for event #{event_id} to topic #{topic}")
         PubSub.broadcast(SportsInfo.PubSub, topic, {:event_update, event_id, event})
       else
-        IO.puts("EventWorker: Skipping broadcast for event #{event_id} in sport #{sport} (not yet initialized)")
+        #IO.puts("EventWorker: Skipping broadcast for event #{event_id} in sport #{sport} (not yet initialized)")
       end
     end)
 
@@ -186,7 +185,7 @@ defmodule SportsInfo.EventWorker do
     Enum.each(stale_entries, fn {{sport, event_id}, _} ->
       ets_table = Map.get(ets_tables, sport)
       if ets_table do
-        IO.puts("EventWorker: Cleaning up stale event #{event_id} for sport #{sport}")
+        #IO.puts("EventWorker: Cleaning up stale event #{event_id} for sport #{sport}")
         :ets.delete(ets_table, event_id)
       end
     end)
@@ -203,10 +202,10 @@ defmodule SportsInfo.EventWorker do
       ets_table = Map.get(ets_tables, sport, nil)
       if ets_table do
         events = :ets.tab2list(ets_table) |> Enum.map(fn {_, event} -> event end)
-        IO.puts("EventWorker: Retrieving #{length(events)} events for sport #{sport}")
+        #IO.puts("EventWorker: Retrieving #{length(events)} events for sport #{sport}")
         events
       else
-        IO.puts("EventWorker: No ETS table for sport #{sport}")
+        #IO.puts("EventWorker: No ETS table for sport #{sport}")
         []
       end
     else
@@ -224,7 +223,7 @@ defmodule SportsInfo.EventWorker do
     event = Enum.reduce_while(ets_tables, nil, fn {sport, ets_table}, acc ->
       case :ets.lookup(ets_table, event_id) do
         [{^event_id, event}] ->
-          IO.puts("EventWorker: Retrieved event #{event_id} for sport #{sport}")
+          #IO.puts("EventWorker: Retrieved event #{event_id} for sport #{sport}")
           {:halt, event}
         [] ->
           {:cont, acc}
@@ -269,11 +268,11 @@ defmodule SportsInfo.EventWorker do
         case :ets.whereis(table_name) do
           :undefined ->
             table = :ets.new(table_name, [:set, :public, :named_table, :compressed, read_concurrency: true, write_concurrency: true])
-            IO.puts("EventWorker: Created new ETS table #{table_name} for sport #{sport}")
+            #IO.puts("EventWorker: Created new ETS table #{table_name} for sport #{sport}")
             table
           table ->
             :ets.setopts(table, {:heir, self(), nil})
-            IO.puts("EventWorker: Reusing existing ETS table #{table_name} for sport #{sport}")
+            #IO.puts("EventWorker: Reusing existing ETS table #{table_name} for sport #{sport}")
             table
         end
       table ->

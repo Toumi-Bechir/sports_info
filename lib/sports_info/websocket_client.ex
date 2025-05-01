@@ -5,7 +5,7 @@ defmodule SportsInfo.WebSocketClient do
 
   def start_link(sport, retries \\ 3) do
     #token = SportsInfo.TokenFetcher.get_token()
-    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1biI6InRiZWNoaXIiLCJuYmYiOjE3NDYwNTg5MjgsImV4cCI6MTc0NjA2MjUyOCwiaWF0IjoxNzQ2MDU4OTI4fQ.GotbYI0iuKCEks24NbDKfeMXGEBj4EgQ8S_t0nQYgFM"
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1biI6InRiZWNoaXIiLCJuYmYiOjE3NDYxMjQxOTQsImV4cCI6MTc0NjEyNzc5NCwiaWF0IjoxNzQ2MTI0MTk0fQ.9OgSMADnNnK5bcwI3ErwYPBRPefB3Qr18qMkCfosd1E"
     unless token do
       IO.puts("No token available for sport #{sport}. Cannot start WebSocketClient.")
       {:error, :no_token}
@@ -58,12 +58,12 @@ defmodule SportsInfo.WebSocketClient do
   end
 
   def handle_frame({:text, msg}, state) do
-    IO.puts("Received WebSocket message for sport #{state.sport}: ")#{msg}
+    #IO.puts("Received WebSocket message for sport #{state.sport}: ")#{msg}
     case Jason.decode(msg) do
       {:ok, message} ->
         # Use the "sp" field from the message if available, otherwise fall back to state.sport
         sport = Map.get(message, "sp")
-        IO.puts("Sport from message +++++++++++++++++++++ +++++++++++++++++ +++++++++++++++  ++++++++++++++++++++ : #{inspect(sport)}") 
+        #IO.puts("Sport from message +++++++++++++++++++++ +++++++++++++++++ +++++++++++++++  ++++++++++++++++++++ : #{inspect(sport)}") 
         message_with_sport = Map.put(message, "sport", sport)
         handle_message(message_with_sport)
         {:ok, state}
@@ -104,13 +104,13 @@ defmodule SportsInfo.WebSocketClient do
   end
 
   defp handle_message(%{"mt" => "updt", "id" => event_id, "sport" => sport} = message) do
-    IO.puts("Processing updt message for event #{event_id} in sport #{sport}")
+    #IO.puts("Processing updt message for event #{event_id} in sport #{sport}")
     message_with_sport = Map.put(message, "sport", sport)
     SportsInfo.MessageProducer.add_message(event_id, message_with_sport)
   end
 
   defp handle_message(message) do
-    IO.puts("Received unknown message type: #{inspect(message)}")
+    #IO.puts("Received unknown message type: #{inspect(message)}")
     :ok
   end
 
