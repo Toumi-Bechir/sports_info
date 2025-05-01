@@ -2,7 +2,7 @@ defmodule SportsInfo.WebSocketSupervisor do
     use DynamicSupervisor
   
     # List of sports supported by Goalserve (from documentation)
-    @sports ["soccer", "basketball", "tennis", "baseball", "amfootball", "hockey", "volleyball"]
+    @sports ["soccer", "basket", "tennis", "baseball", "amfootball", "hockey", "volleyball"]
   
     # Define the child specification
     def child_spec(_opts) do

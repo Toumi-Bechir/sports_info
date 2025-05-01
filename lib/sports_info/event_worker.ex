@@ -1,277 +1,304 @@
 defmodule SportsInfo.EventWorker do
-    use GenServer
-    alias Phoenix.PubSub
-  
-    # Constants
-    @pubsub_topic "sports:events"  # Base topic for broadcasting event updates
-    @num_shards 16  # Number of shards for distributing events
-    @batch_interval 100  # Batch updates every 100ms
-    @cleanup_interval :timer.minutes(5)  # Run cleanup every 5 minutes
-    @stale_threshold :timer.hours(1)  # Consider events stale after 1 hour of inactivity
-  
-    # Client API
-  
-    # Start an EventWorker for a specific shard
-    def start_link(shard) do
-      IO.puts("Starting EventWorker for shard #{shard}...")
-      result = GenServer.start_link(__MODULE__, shard, name: via_tuple(shard))
-      case result do
-        {:ok, pid} ->
-          IO.puts("EventWorker for shard #{shard} started successfully with pid #{inspect(pid)}")
-          result
-        {:error, reason} ->
-          IO.puts("Failed to start EventWorker for shard #{shard}: #{inspect(reason)}")
-          result
-      end
-    end
-  
-    # Process a WebSocket message for a specific event
-    def process_message(event_id, message) do
-      shard = shard_for_event(event_id)
-      group = {SportsInfo.EventWorkerGroup, shard}
-      case :pg.get_members(group) do
-        [] ->
-          # This should not happen since workers are started synchronously
-          IO.puts("No EventWorker found for group #{inspect(group)} during process_message. This should not happen!")
-          :error
-        pids ->
-          pid = Enum.random(pids)
-          GenServer.cast(pid, {:process_message, event_id, message})
-      end
-    end
-  
-    # Retrieve all events managed by a specific shard, optionally filtered by sport, with retries
-    def get_events(shard, sport \\ nil, retries \\ 3) do
-      try do
-        group = {SportsInfo.EventWorkerGroup, shard}
-        case :pg.get_members(group) do
-          [] ->
-            IO.puts("No EventWorker found for group #{inspect(group)} during get_events. This should not happen!")
-            []
-          [pid | _] ->
-            GenServer.call(pid, {:get_events, sport})
-        end
-      catch
-        :exit, _reason when retries > 0 ->
-          IO.puts("Failed to call EventWorker for shard #{shard}, retrying (#{retries} attempts left)...")
-          Process.sleep(1_000)
-          get_events(shard, sport, retries - 1)
-        :exit, reason ->
-          IO.puts("Failed to call EventWorker for shard #{shard} after retries: #{inspect(reason)}")
-          []
-      end
-    end
-  
-    # Retrieve a specific event from a shard, with retries
-    def get_event(shard, event_id, retries \\ 3) do
-      try do
-        group = {SportsInfo.EventWorkerGroup, shard}
-        case :pg.get_members(group) do
-          [] ->
-            IO.puts("No EventWorker found for group #{inspect(group)} during get_event. This should not happen!")
-            nil
-          [pid | _] ->
-            GenServer.call(pid, {:get_event, event_id})
-        end
-      catch
-        :exit, _reason when retries > 0 ->
-          IO.puts("Failed to call EventWorker for shard #{shard}, retrying (#{retries} attempts left)...")
-          Process.sleep(1_000)
-          get_event(shard, event_id, retries - 1)
-        :exit, reason ->
-          IO.puts("Failed to call EventWorker for shard #{shard} after retries: #{inspect(reason)}")
-          nil
-      end
-    end
-  
-    # Server Callbacks
-  
-    # Initialize the EventWorker with ETS tables for each sport
-    def init(shard) do
-      try do
-        # Use a namespaced group name compatible with pre-OTP 26.0
-        group = {SportsInfo.EventWorkerGroup, shard}
-        IO.puts("Joining :pg process group #{inspect(group)}...")
-        :pg.join(group, self())
-        IO.puts("EventWorker for shard #{shard} started and registered as #{inspect(via_tuple(shard))}")
-        ets_tables = %{}
-        schedule_batch_broadcast()
-        schedule_cleanup()
-        {:ok, %{shard: shard, ets_tables: ets_tables, updates: %{}, last_updated: %{}}}
-      catch
-        type, reason ->
-          IO.puts("Failed to initialize EventWorker for shard #{shard} with #{type}: #{inspect(reason)}")
-          stacktrace = System.stacktrace()
-          IO.puts("Stacktrace: #{inspect(stacktrace)}")
-          {:stop, reason}
-      end
-    end
-  
-    # Handle incoming messages (avl or updt) and store them in the appropriate ETS table
-    def handle_cast({:process_message, event_id, message}, state) do
-      try do
-        start_time = System.monotonic_time()
-        %{shard: shard, ets_tables: ets_tables, updates: pending_updates, last_updated: last_updated} = state
-  
-        # Determine the sport from the message
-        sport = Map.get(message, "sport", "unknown")
-        # Get or create the ETS table for this sport
-        ets_table = ensure_ets_table(sport, shard, ets_tables)
-  
-        # Process the message
-        case message do
-          %{"mt" => "avl"} ->
-            event = Enum.find(message["evts"], fn e -> e["id"] == event_id end)
-            if event do
-              :ets.insert(ets_table, {event_id, event})
-            end
-  
-          %{"mt" => "updt"} ->
-            case :ets.lookup(ets_table, event_id) do
-              [{^event_id, existing_event}] ->
-                updated_event = Map.merge(existing_event, message)
-                :ets.insert(ets_table, {event_id, updated_event})
-              [] ->
-                :ets.insert(ets_table, {event_id, message})
-            end
-        end
-  
-        # Update the last_updated timestamp for this event
-        current_time = System.monotonic_time(:millisecond)
-        updated_last_updated = Map.put(last_updated, {sport, event_id}, current_time)
-  
-        # Emit telemetry event
-        duration = System.monotonic_time() - start_time
-        :telemetry.execute([:sports_info, :message_processed], %{duration: duration}, %{event_id: event_id})
-  
-        # Retrieve the updated event and add it to pending updates
-        updated_event = :ets.lookup(ets_table, event_id) |> List.first() |> elem(1)
-        new_pending_updates = Map.put(pending_updates, {sport, event_id}, updated_event)
-  
-        new_state = %{
-          state |
-          ets_tables: Map.put(ets_tables, sport, ets_table),
-          updates: new_pending_updates,
-          last_updated: updated_last_updated
-        }
-        {:noreply, new_state}
-      catch
-        type, reason ->
-          IO.puts("EventWorker for shard #{state.shard} crashed while processing message for event #{event_id} with #{type}: #{inspect(reason)}")
-          stacktrace = System.stacktrace()
-          IO.puts("Stacktrace: #{inspect(stacktrace)}")
-          {:noreply, state}  # Continue running to avoid crashing the process
-      end
-    end
-  
-    # Handle periodic batch broadcast
-    def handle_info(:broadcast_batch, state) do
-      start_time = System.monotonic_time()
-      %{updates: pending_updates} = state
-  
-      # Broadcast updates using sport-specific topics
-      Enum.each(pending_updates, fn {{sport, event_id}, event} ->
-        topic = "#{@pubsub_topic}:#{sport}"
-        PubSub.broadcast(SportsInfo.PubSub, topic, {:event_update, event_id, event})
-      end)
-  
-      # Emit telemetry event
-      duration = System.monotonic_time() - start_time
-      :telemetry.execute([:sports_info, :batch_broadcast], %{duration: duration}, %{count: map_size(pending_updates)})
-  
-      schedule_batch_broadcast()
-      {:noreply, %{state | updates: %{}}}
-    end
-  
-    # Handle periodic cleanup of stale events
-    def handle_info(:cleanup, state) do
-      %{ets_tables: ets_tables, last_updated: last_updated} = state
-      current_time = System.monotonic_time(:millisecond)
-  
-      # Identify and remove stale events
-      stale_entries = Enum.filter(last_updated, fn {_, timestamp} ->
-        current_time - timestamp > @stale_threshold
-      end)
-  
-      Enum.each(stale_entries, fn {{sport, event_id}, _} ->
-        ets_table = Map.get(ets_tables, sport)
-        if ets_table do
-          :ets.delete(ets_table, event_id)
-        end
-      end)
-  
-      # Update last_updated by removing stale entries
-      updated_last_updated = Map.drop(last_updated, Enum.map(stale_entries, fn {key, _} -> key end))
-  
-      schedule_cleanup()
-      {:noreply, %{state | last_updated: updated_last_updated}}
-    end
-  
-    # Return all events in this shard, optionally filtered by sport
-    def handle_call({:get_events, sport}, _from, state) do
-      %{ets_tables: ets_tables} = state
-      events = if sport do
-        ets_table = Map.get(ets_tables, sport, nil)
-        if ets_table do
-          :ets.tab2list(ets_table) |> Enum.map(fn {_, event} -> event end)
-        else
-          []
-        end
-      else
-        ets_tables
-        |> Map.values()
-        |> Enum.flat_map(fn ets_table ->
-          :ets.tab2list(ets_table) |> Enum.map(fn {_, event} -> event end)
-        end)
-      end
-      {:reply, events, state}
-    end
-  
-    # Return a specific event from this shard
-    def handle_call({:get_event, event_id}, _from, state) do
-      %{ets_tables: ets_tables} = state
-      # Search for the event across all sport-specific ETS tables
-      event = Enum.reduce_while(ets_tables, nil, fn {sport, ets_table}, acc ->
-        case :ets.lookup(ets_table, event_id) do
-          [{^event_id, event}] -> {:halt, event}
-          [] -> {:cont, acc}
-        end
-      end)
-      {:reply, event, state}
-    end
-  
-    # Helper Functions
-  
-    # Construct the registry tuple for naming the EventWorker process
-    defp via_tuple(shard) do
-      {:global, {:event_worker, shard}}
-    end
-  
-    # Calculate the shard for an event based on its ID
-    defp shard_for_event(event_id) do
-      :erlang.phash2(event_id, @num_shards)
-    end
-  
-    # Schedule the next batch broadcast
-    defp schedule_batch_broadcast do
-      Process.send_after(self(), :broadcast_batch, @batch_interval)
-    end
-  
-    # Schedule the next cleanup
-    defp schedule_cleanup do
-      Process.send_after(self(), :cleanup, @cleanup_interval)
-    end
-  
-    # Ensure an ETS table exists for the given sport
-    defp ensure_ets_table(sport, shard, ets_tables) do
-      case Map.get(ets_tables, sport) do
-        nil ->
-          # Create a new ETS table for this sport with optimized settings
-          table_name = :"events_shard_#{shard}_#{sport}"
-          ets_table = :ets.new(table_name, [:set, :public, :named_table, :compressed, read_concurrency: true, write_concurrency: true])
-          ets_table
-        table ->
-          table
-      end
+  use GenServer
+  alias Phoenix.PubSub
+
+  @pubsub_topic "sports:events"
+  @num_shards 16
+  @batch_interval 50
+  @cleanup_interval :timer.minutes(5)
+  @stale_threshold :timer.hours(1)
+
+  def start_link(shard) do
+    GenServer.start_link(__MODULE__, shard, name: via_tuple(shard))
+  end
+
+  def process_message(event_id, message) do
+    shard = shard_for_event(event_id)
+    case :pg.get_members(SportsInfo.EventWorkerGroup, shard) do
+      [] ->
+        SportsInfo.EventWorkerSupervisor.start_worker(shard)
+        GenServer.cast(via_tuple(shard), {:process_message, event_id, message})
+      pids ->
+        pid = Enum.random(pids)
+        GenServer.cast(pid, {:process_message, event_id, message})
     end
   end
+
+  def get_events(shard, sport \\ nil) do
+    case :pg.get_members(SportsInfo.EventWorkerGroup, shard) do
+      [] ->
+        SportsInfo.EventWorkerSupervisor.start_worker(shard)
+        GenServer.call(via_tuple(shard), {:get_events, sport})
+      [pid | _] ->
+        GenServer.call(pid, {:get_events, sport})
+    end
+  end
+
+  def get_event(shard, event_id) do
+    case :pg.get_members(SportsInfo.EventWorkerGroup, shard) do
+      [] ->
+        SportsInfo.EventWorkerSupervisor.start_worker(shard)
+        GenServer.call(via_tuple(shard), {:get_event, event_id})
+      [pid | _] ->
+        GenServer.call(pid, {:get_event, event_id})
+    end
+  end
+
+  def init(shard) do
+    :pg.join(SportsInfo.EventWorkerGroup, shard, self())
+    ets_tables = %{}
+    schedule_batch_broadcast()
+    schedule_cleanup()
+    {:ok, %{shard: shard, ets_tables: ets_tables, updates: %{}, pending_updates: %{}, last_updated: %{}, initialized: %{}}}
+  end
+
+  def handle_cast({:process_message, event_id, message}, state) do
+    start_time = System.monotonic_time()
+    %{shard: shard, ets_tables: ets_tables, updates: updates, pending_updates: pending_updates, last_updated: last_updated, initialized: initialized} = state
+
+    # Extract the sport based on message type
+    sport = case message do
+      %{"mt" => "avl", "evts" => events} ->
+        # For avl messages, the sport is in the event map within "evts"
+        event = Enum.find(events, fn e -> e["id"] == event_id end)
+        if event, do: Map.get(event, "sport", "unknown"), else: "unknown"
+      %{"mt" => "updt"} ->
+        # For updt messages, the sport is at the top level
+        Map.get(message, "sport", "unknown")
+      _ ->
+        "unknown"
+    end
+
+    ets_table = ensure_ets_table(sport, shard, ets_tables)
+
+    case message do
+      %{"mt" => "avl"} ->
+        event = Enum.find(message["evts"], fn e -> e["id"] == event_id end)
+        if event do
+          updated_event = Map.put(event, "sport", sport)
+          IO.puts("EventWorker: Storing avl event #{event_id} in ETS for sport #{sport}")
+          :ets.insert(ets_table, {event_id, updated_event})
+
+          new_initialized = Map.put(initialized, {sport, event_id}, true)
+
+          new_pending_updates = case Map.get(pending_updates, {sport, event_id}) do
+            nil ->
+              pending_updates
+            pending_message ->
+              merged_event = Map.merge(updated_event, pending_message)
+              IO.puts("EventWorker: Applying pending update for event #{event_id} in sport #{sport}")
+              :ets.insert(ets_table, {event_id, merged_event})
+              Map.delete(pending_updates, {sport, event_id})
+          end
+
+          new_updates = Map.put(updates, {sport, event_id}, updated_event)
+
+          current_time = System.monotonic_time(:millisecond)
+          updated_last_updated = Map.put(last_updated, {sport, event_id}, current_time)
+
+          new_state = %{
+            state |
+            ets_tables: Map.put(ets_tables, sport, ets_table),
+            updates: new_updates,
+            pending_updates: new_pending_updates,
+            last_updated: updated_last_updated,
+            initialized: new_initialized
+          }
+          {:noreply, new_state}
+        else
+          IO.puts("EventWorker: Event #{event_id} not found in avl message")
+          {:noreply, state}
+        end
+
+      %{"mt" => "updt"} ->
+        sport = find_event_sport(ets_tables, event_id) || sport
+
+        ets_table = ensure_ets_table(sport, shard, ets_tables)
+
+        case :ets.lookup(ets_table, event_id) do
+          [{^event_id, existing_event}] ->
+            updated_event = Map.merge(existing_event, message)
+                           |> Map.put("sport", sport)
+                           |> ensure_cmp_name(existing_event)
+            IO.puts("EventWorker: Updating event #{event_id} in ETS for sport #{sport}")
+            :ets.insert(ets_table, {event_id, updated_event})
+
+            current_time = System.monotonic_time(:millisecond)
+            updated_last_updated = Map.put(last_updated, {sport, event_id}, current_time)
+
+            new_updates = Map.put(updates, {sport, event_id}, updated_event)
+
+            new_state = %{
+              state |
+              ets_tables: Map.put(ets_tables, sport, ets_table),
+              updates: new_updates,
+              last_updated: updated_last_updated
+            }
+            {:noreply, new_state}
+          [] ->
+            IO.puts("EventWorker: Buffering updt message for event #{event_id} in sport #{sport} (no prior avl message)")
+            new_pending_updates = Map.put(pending_updates, {sport, event_id}, message)
+
+            current_time = System.monotonic_time(:millisecond)
+            updated_last_updated = Map.put(last_updated, {sport, event_id}, current_time)
+
+            new_state = %{
+              state |
+              ets_tables: Map.put(ets_tables, sport, ets_table),
+              pending_updates: new_pending_updates,
+              last_updated: updated_last_updated
+            }
+            {:noreply, new_state}
+        end
+    end
+  end
+
+  def handle_info(:broadcast_batch, state) do
+    start_time = System.monotonic_time()
+    %{updates: updates, initialized: initialized} = state
+
+    #IO.puts("EventWorker: Broadcasting batch with #{map_size(updates)} updates")
+    Enum.each(updates, fn {{sport, event_id}, event} ->
+      if Map.get(initialized, {sport, event_id}, false) do
+        topic = "#{@pubsub_topic}:#{sport}"
+        IO.puts("EventWorker: Broadcasting update for event #{event_id} to topic #{topic}")
+        PubSub.broadcast(SportsInfo.PubSub, topic, {:event_update, event_id, event})
+      else
+        IO.puts("EventWorker: Skipping broadcast for event #{event_id} in sport #{sport} (not yet initialized)")
+      end
+    end)
+
+    duration = System.monotonic_time() - start_time
+    :telemetry.execute([:sports_info, :batch_broadcast], %{duration: duration}, %{count: map_size(updates)})
+
+    schedule_batch_broadcast()
+    {:noreply, %{state | updates: %{}}}
+  end
+
+  def handle_info(:cleanup, state) do
+    %{ets_tables: ets_tables, last_updated: last_updated} = state
+    current_time = System.monotonic_time(:millisecond)
+
+    stale_entries = Enum.filter(last_updated, fn {_, timestamp} ->
+      current_time - timestamp > @stale_threshold
+    end)
+
+    Enum.each(stale_entries, fn {{sport, event_id}, _} ->
+      ets_table = Map.get(ets_tables, sport)
+      if ets_table do
+        IO.puts("EventWorker: Cleaning up stale event #{event_id} for sport #{sport}")
+        :ets.delete(ets_table, event_id)
+      end
+    end)
+
+    updated_last_updated = Map.drop(last_updated, Enum.map(stale_entries, fn {key, _} -> key end))
+
+    schedule_cleanup()
+    {:noreply, %{state | last_updated: updated_last_updated}}
+  end
+
+  def handle_call({:get_events, sport}, _from, state) do
+    %{ets_tables: ets_tables} = state
+    events = if sport do
+      ets_table = Map.get(ets_tables, sport, nil)
+      if ets_table do
+        events = :ets.tab2list(ets_table) |> Enum.map(fn {_, event} -> event end)
+        IO.puts("EventWorker: Retrieving #{length(events)} events for sport #{sport}")
+        events
+      else
+        IO.puts("EventWorker: No ETS table for sport #{sport}")
+        []
+      end
+    else
+      ets_tables
+      |> Map.values()
+      |> Enum.flat_map(fn ets_table ->
+        :ets.tab2list(ets_table) |> Enum.map(fn {_, event} -> event end)
+      end)
+    end
+    {:reply, events, state}
+  end
+
+  def handle_call({:get_event, event_id}, _from, state) do
+    %{ets_tables: ets_tables} = state
+    event = Enum.reduce_while(ets_tables, nil, fn {sport, ets_table}, acc ->
+      case :ets.lookup(ets_table, event_id) do
+        [{^event_id, event}] ->
+          IO.puts("EventWorker: Retrieved event #{event_id} for sport #{sport}")
+          {:halt, event}
+        [] ->
+          {:cont, acc}
+      end
+    end)
+    {:reply, event, state}
+  end
+
+  def terminate(_reason, state) do
+    %{shard: shard, ets_tables: ets_tables} = state
+    IO.puts("EventWorker for shard #{shard} terminating, leaving process group")
+    :pg.leave(SportsInfo.EventWorkerGroup, shard, self())
+
+    Enum.each(ets_tables, fn {sport, table} ->
+      IO.puts("EventWorker: Deleting ETS table for sport #{sport}: #{table}")
+      :ets.delete(table)
+    end)
+
+    :ok
+  end
+
+  defp via_tuple(shard) do
+    {:global, {:event_worker, shard}}
+  end
+
+  defp shard_for_event(event_id) do
+    :erlang.phash2(event_id, @num_shards)
+  end
+
+  defp schedule_batch_broadcast do
+    Process.send_after(self(), :broadcast_batch, @batch_interval)
+  end
+
+  defp schedule_cleanup do
+    Process.send_after(self(), :cleanup, @cleanup_interval)
+  end
+
+  defp ensure_ets_table(sport, shard, ets_tables) do
+    case Map.get(ets_tables, sport) do
+      nil ->
+        table_name = :"events_shard_#{shard}_#{sport}"
+        case :ets.whereis(table_name) do
+          :undefined ->
+            table = :ets.new(table_name, [:set, :public, :named_table, :compressed, read_concurrency: true, write_concurrency: true])
+            IO.puts("EventWorker: Created new ETS table #{table_name} for sport #{sport}")
+            table
+          table ->
+            :ets.setopts(table, {:heir, self(), nil})
+            IO.puts("EventWorker: Reusing existing ETS table #{table_name} for sport #{sport}")
+            table
+        end
+      table ->
+        table
+    end
+  end
+
+  defp ensure_cmp_name(updated_event, existing_event) do
+    case Map.get(updated_event, "cmp_name") do
+      nil ->
+        cmp_name = Map.get(existing_event, "cmp_name", "Unknown League")
+        Map.put(updated_event, "cmp_name", cmp_name)
+      _ ->
+        updated_event
+    end
+  end
+
+  defp find_event_sport(ets_tables, event_id) do
+    Enum.reduce_while(ets_tables, nil, fn {sport, ets_table}, acc ->
+      case :ets.lookup(ets_table, event_id) do
+        [{^event_id, _event}] ->
+          {:halt, sport}
+        [] ->
+          {:cont, acc}
+      end
+    end)
+  end
+end

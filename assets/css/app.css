@@ -2,10 +2,56 @@
 @import "tailwindcss/components";
 @import "tailwindcss/utilities";
 
-/* This file is for your main application CSS */
 /* Custom styles for bet365-like design */
 body {
-    font-family: Arial, sans-serif;
-    background-color: #1e1e1e;
-    color: #ffffff;
-  }
+  font-family: Arial, sans-serif;
+  background-color: #1e1e1e;
+  color: #ffffff;
+}
+
+/* Ensure buttons and links have the correct hover effects */
+button, a {
+  transition: background-color 0.2s ease-in-out;
+}
+
+/* Custom styles for match rows and markets */
+.match-row {
+  @apply grid grid-cols-5 gap-2 text-center text-sm bg-[#2d2d2d] p-2;
+}
+
+.match-row:hover {
+  @apply bg-[#3a3a3a];
+}
+
+.market-option {
+  @apply p-2 bg-[#3a3a3a] rounded hover:bg-[#4a4a4a];
+}
+
+/* Custom styles for headers */
+.league-header {
+  @apply text-lg font-bold text-teal-400 mb-2;
+}
+
+/* Virtualization container */
+#match-list {
+  @apply overflow-y-auto;
+  max-height: calc(100vh - 200px); /* Adjust based on your layout */
+}
+
+/* Scrollbar styles to match bet365 */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #5a5a5a;
+}
